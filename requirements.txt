@@ -1,12 +1,12 @@
-numpy<2
-opencv-python-headless==4.10.0.84
-
-# Explicitly prevent GUI OpenCV from installing on Linux (Streamlit Cloud)
-opencv-python==4.10.0.84; platform_system=="Windows"
-
+numpy
 streamlit
 yt-dlp
-ultralytics==8.3.237
-torch==2.9.1
-torchvision==0.24.1
+ultralytics
+# Note: `ultralytics` may install `opencv-python` (GUI build) which fails on Streamlit Cloud
+# with `libGL.so.1` errors. `postBuild` force-uninstalls it and reinstalls headless.
+opencv-python-headless==4.11.0.86
 shapely>=2.0.0,<3
+ 
+# Optional (only needed for "Webcam (streamlit-webrtc)" mode):
+# streamlit-webrtc
+# av
