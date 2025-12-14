@@ -1,5 +1,4 @@
 import os
-import cv2
 import math
 import time
 import subprocess
@@ -8,8 +7,43 @@ import tempfile
 import pathlib
 from collections import defaultdict, deque
 
-from ultralytics import YOLO
-from ultralytics.solutions import Heatmap
+try:
+    import cv2  # type: ignore
+except ModuleNotFoundError:
+    cv2 = None
+
+
+def _require_cv2():
+    if cv2 is None:
+        raise ModuleNotFoundError(
+            "Missing dependency: `cv2` (OpenCV).\n\n"
+            "For Streamlit Cloud, add `opencv-python-headless` to `requirements.txt` and redeploy."
+        )
+
+    return cv2
+
+
+def _require_ultralytics():
+    import sys
+
+    if sys.version_info >= (3, 13):
+        raise RuntimeError(
+            "Ultralytics requires PyTorch, which (currently) does not provide wheels for Python 3.13. "
+            "Use Python 3.12 (or 3.11), recreate your virtualenv, then install deps."
+        )
+
+    try:
+        from ultralytics import YOLO  # type: ignore
+        from ultralytics.solutions import Heatmap  # type: ignore
+    except ModuleNotFoundError as e:
+        raise ModuleNotFoundError(
+            "Missing dependency: `ultralytics`.\n\n"
+            "Install it in your current environment, e.g.:\n"
+            "  python -m pip install ultralytics\n\n"
+            "If you are on Python 3.13, create a Python 3.12 venv instead (PyTorch wheels are not available for 3.13)."
+        ) from e
+
+    return YOLO, Heatmap
 
 
 # ===============================
@@ -70,6 +104,7 @@ def process_frame(
     imgsz=INFERENCE_SIZE,
 ):
     """Run YOLO tracking + Ultralytics Heatmap, returning an annotated BGR image and counters."""
+    cv2 = _require_cv2()
     stopped_ids = set()
     moving_ids = set()
 
@@ -178,6 +213,13 @@ def process_frame(
 # CLI (OpenCV window)
 # ===============================
 def run_cli():
+    try:
+        cv2 = _require_cv2()
+        YOLO, Heatmap = _require_ultralytics()
+    except Exception as e:
+        print(str(e))
+        return
+
     print(f"Loading model {MODEL_PATH}...")
     model = YOLO(MODEL_PATH)
 
@@ -262,6 +304,13 @@ def _running_in_streamlit():
 
 def run_streamlit():
     import streamlit as st
+
+    try:
+        cv2 = _require_cv2()
+        YOLO, Heatmap = _require_ultralytics()
+    except Exception as e:
+        st.error(str(e))
+        st.stop()
 
     st.set_page_config(page_title="Traffic Heatmap (YOLO + Ultralytics Heatmap)", layout="wide")
     st.title("Traffic analysis heatmap (YOLO tracking + Ultralytics Heatmap)")
