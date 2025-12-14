@@ -84,7 +84,7 @@ def _require_ultralytics():
 # CONFIGURATION
 # ===============================
 MODEL_PATH = "yolo11n.pt"
-DEFAULT_YOUTUBE_URL = "https://www.youtube.com/watch?v=muijHPW82vI"
+DEFAULT_YOUTUBE_URL = ""
 
 CONF = 0.25
 IOU = 0.60
@@ -144,6 +144,29 @@ def get_ytdlp_info(url: str) -> dict | None:
     except Exception as e:
         print(f"Error fetching yt-dlp info: {e}")
         return None
+
+
+def _is_probably_youtube_live(info: dict | None) -> bool:
+    if not info:
+        return False
+    live_status = (info.get("live_status") or "").lower()
+    if info.get("is_live") is True:
+        return True
+    if live_status in {"is_live", "is_upcoming"}:
+        return True
+    if info.get("was_live") is True and info.get("duration") in {None, 0}:
+        return True
+    formats = info.get("formats") or []
+    for f in formats:
+        u = (f.get("url") or "")
+        if "yt_live_broadcast" in u:
+            return True
+        proto = (f.get("protocol") or "").lower()
+        if proto.startswith("m3u8"):
+            # If only HLS is available and duration isn't known, treat as live-ish for Cloud.
+            if info.get("duration") is None:
+                return True
+    return False
 
 
 def download_youtube_video(url: str, *, out_dir: str | None = None) -> str | None:
@@ -425,8 +448,7 @@ def run_cli():
 
     url = input("Enter YouTube URL: ").strip()
     info = get_ytdlp_info(url)
-    is_live = bool((info or {}).get("is_live") or (info or {}).get("live_status") in {"is_live", "post_live"})
-    if is_live:
+    if _is_probably_youtube_live(info):
         print("❌ Live YouTube streams are not supported in this mode.")
         print("   Download locally (or use a recorded video) and pass a file path instead.")
         return
@@ -618,8 +640,7 @@ def run_streamlit():
         url = st.text_input("YouTube URL", value=DEFAULT_YOUTUBE_URL)
         if start:
             info = get_ytdlp_info(url.strip())
-            is_live = bool((info or {}).get("is_live") or (info or {}).get("live_status") in {"is_live", "post_live"})
-            if is_live:
+            if _is_probably_youtube_live(info):
                 st.error(
                     "This looks like a **YouTube live stream**. Streamlit Cloud often can't download live HLS streams (403 from Googlevideo).\n\n"
                     "Use **Upload video** instead (download the video locally first), or use a non-live/recorded YouTube video."
@@ -632,7 +653,8 @@ def run_streamlit():
             if not downloaded:
                 st.error(
                     "Failed to download YouTube video (common on Streamlit Cloud).\n\n"
-                    "Use **Upload video** instead."
+                    "If the URL is a live stream, use **Upload video** instead.\n"
+                    "Otherwise, try a different (recorded) YouTube video or upload directly."
                 )
                 st.stop()
             st.session_state.tmpfile = downloaded
