@@ -1,0 +1,9 @@
+numpy
+opencv-python-headless
+streamlit
+yt-dlp
+ultralytics
+
+# Optional (only needed for "Webcam (streamlit-webrtc)" mode):
+# streamlit-webrtc
+# av
