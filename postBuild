@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Some dependencies (e.g. `ultralytics`) may pull in `opencv-python`, which can conflict with
+# `opencv-python-headless` on Streamlit Cloud. Ensure the final installed OpenCV distribution
+# is the headless one, so `import cv2` works without system GUI libraries.
+if command -v uv >/dev/null 2>&1; then
+  uv pip uninstall -y opencv-python opencv-contrib-python opencv-contrib-python-headless || true
+  uv pip install --no-cache-dir --force-reinstall opencv-python-headless==4.11.0.86
+else
+  python -m pip uninstall -y opencv-python opencv-contrib-python opencv-contrib-python-headless || true
+  python -m pip install --no-cache-dir --force-reinstall opencv-python-headless==4.11.0.86
+fi
