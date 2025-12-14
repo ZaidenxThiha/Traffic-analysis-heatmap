@@ -9,7 +9,7 @@ from collections import defaultdict, deque
 
 try:
     import cv2  # type: ignore
-except ModuleNotFoundError:
+except (ModuleNotFoundError, ImportError):
     cv2 = None
 
 
