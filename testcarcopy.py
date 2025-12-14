@@ -20,8 +20,14 @@ def _attempt_fix_cv2():
     if not _running_in_streamlit():
         return
 
+    # Streamlit Cloud runtimes commonly run in a non-writable environment.
+    # Do not attempt runtime package surgery unless explicitly allowed.
+    if os.environ.get("ALLOW_RUNTIME_PIP_FIX", "").strip() not in {"1", "true", "TRUE", "yes", "YES"}:
+        return
+
     try:
-        subprocess.check_call(["uv", "pip", "uninstall", "-y", "opencv-python", "opencv-contrib-python", "opencv-contrib-python-headless"])
+        # `uv pip uninstall` doesn't accept `-y` on some versions; keep this best-effort.
+        subprocess.check_call(["uv", "pip", "uninstall", "opencv-python", "opencv-contrib-python", "opencv-contrib-python-headless"])
         subprocess.check_call(["uv", "pip", "install", "--no-cache-dir", "--force-reinstall", "opencv-python-headless==4.11.0.86"])
         return
     except Exception:
@@ -48,7 +54,8 @@ def _require_cv2():
                 raise ModuleNotFoundError(
                     "Missing dependency: `cv2` (OpenCV).\n\n"
                     "On Streamlit Cloud, prefer `opencv-python-headless` (and avoid installing `opencv-python`).\n"
-                    "This repo includes a `postBuild` script to force headless; reboot the app to trigger a fresh build.\n\n"
+                    "Note: `ultralytics` often pulls in `opencv-python` by default; this repo's `postBuild` forces headless.\n"
+                    "Reboot the app to trigger a fresh build.\n\n"
                     f"Original import error: {e}"
                 ) from e
 
