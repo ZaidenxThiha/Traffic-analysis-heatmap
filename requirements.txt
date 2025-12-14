@@ -1,12 +1,9 @@
 numpy<2
 opencv-python-headless==4.10.0.84
+opencv-python==0
 streamlit
 yt-dlp
-ultralytics
-torch
-torchvision
+ultralytics==8.3.237
+torch==2.9.1
+torchvision==0.24.1
 shapely>=2.0.0,<3
-
-# Optional (only needed for "Webcam (streamlit-webrtc)" mode):
-# streamlit-webrtc
-# av
