@@ -11,3 +11,26 @@ else
   python -m pip uninstall -y opencv-python opencv-contrib-python opencv-contrib-python-headless || true
   python -m pip install --no-cache-dir --force-reinstall opencv-python-headless==4.11.0.86
 fi
+
+echo "== OpenCV sanity check =="
+python - <<'PY'
+import importlib
+import importlib.metadata as md
+
+for dist in [
+    "opencv-python-headless",
+    "opencv-python",
+    "opencv-contrib-python",
+    "opencv-contrib-python-headless",
+]:
+    try:
+        print(f"{dist}=={md.version(dist)}")
+    except md.PackageNotFoundError:
+        print(f"{dist} (not installed)")
+
+try:
+    cv2 = importlib.import_module("cv2")
+    print("cv2 import OK", getattr(cv2, "__version__", ""))
+except Exception as e:
+    raise SystemExit(f"cv2 import FAILED: {e!r}")
+PY
