@@ -5,6 +5,7 @@ import subprocess
 import numpy as np
 import tempfile
 import pathlib
+import importlib
 from collections import defaultdict, deque
 
 try:
@@ -13,25 +14,48 @@ except (ModuleNotFoundError, ImportError):
     cv2 = None
 
 
+def _attempt_fix_cv2():
+    import sys
+
+    if not _running_in_streamlit():
+        return
+
+    try:
+        subprocess.check_call(["uv", "pip", "uninstall", "-y", "opencv-python", "opencv-contrib-python", "opencv-contrib-python-headless"])
+        subprocess.check_call(["uv", "pip", "install", "--no-cache-dir", "--force-reinstall", "opencv-python-headless==4.11.0.86"])
+        return
+    except Exception:
+        pass
+
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "uninstall", "-y", "opencv-python", "opencv-contrib-python", "opencv-contrib-python-headless"])
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-cache-dir", "--force-reinstall", "opencv-python-headless==4.11.0.86"])
+    except Exception:
+        return
+
+
 def _require_cv2():
+    global cv2
+
     if cv2 is None:
-        raise ModuleNotFoundError(
-            "Missing dependency: `cv2` (OpenCV).\n\n"
-            "For Streamlit Cloud, add `opencv-python-headless` to `requirements.txt` and redeploy."
-        )
+        try:
+            cv2 = importlib.import_module("cv2")
+        except Exception:
+            _attempt_fix_cv2()
+            try:
+                cv2 = importlib.import_module("cv2")
+            except Exception as e:
+                raise ModuleNotFoundError(
+                    "Missing dependency: `cv2` (OpenCV).\n\n"
+                    "On Streamlit Cloud, prefer `opencv-python-headless` (and avoid installing `opencv-python`).\n"
+                    "This repo includes a `postBuild` script to force headless; reboot the app to trigger a fresh build.\n\n"
+                    f"Original import error: {e}"
+                ) from e
 
     return cv2
 
 
 def _require_ultralytics():
-    import sys
-
-    if sys.version_info >= (3, 13):
-        raise RuntimeError(
-            "Ultralytics requires PyTorch, which (currently) does not provide wheels for Python 3.13. "
-            "Use Python 3.12 (or 3.11), recreate your virtualenv, then install deps."
-        )
-
     try:
         from ultralytics import YOLO  # type: ignore
         from ultralytics.solutions import Heatmap  # type: ignore
@@ -40,7 +64,7 @@ def _require_ultralytics():
             "Missing dependency: `ultralytics`.\n\n"
             "Install it in your current environment, e.g.:\n"
             "  python -m pip install ultralytics\n\n"
-            "If you are on Python 3.13, create a Python 3.12 venv instead (PyTorch wheels are not available for 3.13)."
+            "If the import fails due to `torch` missing, install a compatible PyTorch wheel for your Python version."
         ) from e
 
     return YOLO, Heatmap
@@ -49,8 +73,6 @@ def _require_ultralytics():
 # ===============================
 # CONFIGURATION
 # ===============================
-OUTPUT_VIDEO = "traffic_analysis_heatmap.mp4"
-
 MODEL_PATH = "yolo11n.pt"
 DEFAULT_YOUTUBE_URL = "https://www.youtube.com/watch?v=muijHPW82vI"
 
@@ -87,6 +109,11 @@ def extract_youtube_stream(url):
     except Exception as e:
         print(f"Error extracting stream: {e}")
         return None
+
+
+def _looks_like_hls_stream(url: str) -> bool:
+    u = (url or "").lower()
+    return u.startswith(("http://", "https://")) and (u.endswith(".m3u8") or "hls_playlist" in u or "/hls_" in u)
 
 
 # ===============================
@@ -229,6 +256,11 @@ def run_cli():
         print("❌ Failed to extract stream.")
         return
 
+    if _looks_like_hls_stream(source):
+        print("❌ This YouTube stream is HLS (.m3u8). OpenCV VideoCapture often can't open HLS URLs.")
+        print("   Use a downloaded/uploaded video file instead.")
+        return
+
     cap = cv2.VideoCapture(source)
     if not cap.isOpened():
         print("❌ Failed to open stream.")
@@ -239,15 +271,7 @@ def run_cli():
         print("❌ No frames received.")
         return
 
-    H, W = frame.shape[:2]
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
-
-    writer = cv2.VideoWriter(
-        OUTPUT_VIDEO,
-        cv2.VideoWriter_fourcc(*"mp4v"),
-        fps,
-        (W, H)
-    )
 
     # Ultralytics native heatmap (current API uses .process())
     yolo_heatmap = Heatmap(
@@ -280,13 +304,11 @@ def run_cli():
         )
 
         cv2.imshow("Smart Traffic Heatmap", frame_with_heatmap)
-        writer.write(frame_with_heatmap)
 
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
 
     cap.release()
-    writer.release()
     cv2.destroyAllWindows()
 
 
@@ -325,8 +347,6 @@ def run_streamlit():
         iou = st.slider("IOU", 0.0, 1.0, float(IOU), 0.01)
         imgsz = st.select_slider("Inference size", options=[640, 960, 1280, 1600], value=int(INFERENCE_SIZE))
         frames_per_run = st.select_slider("Frames per refresh", options=[1, 2, 4, 8, 16], value=4)
-        save_video = st.checkbox("Save processed video", value=False)
-        output_path = st.text_input("Output path", value=OUTPUT_VIDEO, disabled=not save_video)
 
         st.divider()
         input_mode = st.radio("Source", options=["Webcam (streamlit-webrtc)", "YouTube URL", "Upload video"])
@@ -411,8 +431,6 @@ def run_streamlit():
 
     if "cap" not in st.session_state:
         st.session_state.cap = None
-    if "writer" not in st.session_state:
-        st.session_state.writer = None
     if "tmpfile" not in st.session_state:
         st.session_state.tmpfile = None
     if "fps" not in st.session_state:
@@ -434,6 +452,12 @@ def run_streamlit():
             if not source:
                 st.error("Failed to extract stream. Ensure `yt-dlp` is installed and the URL is valid.")
                 st.stop()
+            if _looks_like_hls_stream(source):
+                st.error(
+                    "This YouTube source is an HLS stream (.m3u8). OpenCV on Streamlit Cloud usually can't open it.\n\n"
+                    "Use **Upload video** (recommended) or **Webcam** mode instead."
+                )
+                st.stop()
     elif input_mode == "Upload video":
         upload = st.file_uploader("Upload .mp4/.mov", type=["mp4", "mov", "mkv", "avi"])
         if start:
@@ -453,11 +477,6 @@ def run_streamlit():
                 st.session_state.cap.release()
             except Exception:
                 pass
-        if st.session_state.writer is not None:
-            try:
-                st.session_state.writer.release()
-            except Exception:
-                pass
         st.session_state.track_history = defaultdict(lambda: deque(maxlen=MOTION_WINDOW))
         st.session_state.cap = cv2.VideoCapture(source)
         if not st.session_state.cap.isOpened():
@@ -467,30 +486,6 @@ def run_streamlit():
 
         fps = st.session_state.cap.get(cv2.CAP_PROP_FPS) or 30.0
         st.session_state.fps = float(fps)
-
-        if save_video:
-            ret, first = st.session_state.cap.read()
-            if not ret:
-                st.error("Could not read the first frame.")
-                st.session_state.cap.release()
-                st.session_state.cap = None
-                st.stop()
-            h, w = first.shape[:2]
-            st.session_state.writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), st.session_state.fps, (w, h))
-            processed, stopped, moving = process_frame(
-                first,
-                model=model,
-                yolo_heatmap=yolo_heatmap,
-                track_history=st.session_state.track_history,
-                fps=st.session_state.fps,
-                conf=conf,
-                iou=iou,
-                imgsz=imgsz,
-            )
-            st.session_state.writer.write(processed)
-            frame_slot.image(processed, channels="BGR", use_container_width=True)
-            stopped_slot.metric("Stopped", stopped)
-            moving_slot.metric("Moving", moving)
 
         st.session_state.running = True
 
@@ -516,8 +511,6 @@ def run_streamlit():
             frame_slot.image(processed, channels="BGR", use_container_width=True)
             stopped_slot.metric("Stopped", stopped)
             moving_slot.metric("Moving", moving)
-            if st.session_state.writer is not None:
-                st.session_state.writer.write(processed)
 
         if st.session_state.running:
             time.sleep(0.001)
@@ -530,12 +523,6 @@ def run_streamlit():
             except Exception:
                 pass
             st.session_state.cap = None
-        if st.session_state.writer is not None:
-            try:
-                st.session_state.writer.release()
-            except Exception:
-                pass
-            st.session_state.writer = None
         if st.session_state.tmpfile:
             try:
                 os.unlink(st.session_state.tmpfile)
