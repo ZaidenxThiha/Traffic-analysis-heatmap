@@ -1,0 +1,5 @@
+[server]
+# Streamlit Community Cloud can hit inotify limits when the repo contains many files.
+# Disabling the watcher avoids: "OSError: [Errno 28] inotify watch limit reached".
+fileWatcherType = "none"
+
