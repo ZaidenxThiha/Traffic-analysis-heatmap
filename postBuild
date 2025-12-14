@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Some dependencies (e.g. `ultralytics`) may pull in `opencv-python`, which can conflict with
-# `opencv-python-headless` on Streamlit Cloud. Ensure the final installed OpenCV distribution
-# is the headless one, so `import cv2` works without system GUI libraries.
-if command -v uv >/dev/null 2>&1; then
-  uv pip uninstall -y opencv-python opencv-contrib-python opencv-contrib-python-headless || true
-  uv pip install --no-cache-dir --force-reinstall opencv-python-headless==4.11.0.86
-else
-  python -m pip uninstall -y opencv-python opencv-contrib-python opencv-contrib-python-headless || true
-  python -m pip install --no-cache-dir --force-reinstall opencv-python-headless==4.11.0.86
+# Streamlit Cloud images sometimes only have `python3` in PATH.
+PY_BIN="python"
+if ! command -v "${PY_BIN}" >/dev/null 2>&1; then
+  PY_BIN="python3"
 fi
 
+# Some dependencies (e.g. `ultralytics`) may pull in `opencv-python` (GUI build) which can fail
+# on Streamlit Cloud with `libGL.so.1` errors. Ensure the *last* installed OpenCV wheel is the
+# headless one; a force reinstall is enough and avoids uv/pip uninstall prompts/permission issues.
+"${PY_BIN}" -m pip install --no-cache-dir --upgrade --force-reinstall opencv-python-headless==4.11.0.86
+
 echo "== OpenCV sanity check =="
-python - <<'PY'
+"${PY_BIN}" - <<'PY'
 import importlib
 import importlib.metadata as md
 
