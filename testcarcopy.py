@@ -150,22 +150,55 @@ def _is_probably_youtube_live(info: dict | None) -> bool:
     if not info:
         return False
     live_status = (info.get("live_status") or "").lower()
+    duration = info.get("duration")
+    duration_unknown = duration in {None, 0}
     if info.get("is_live") is True:
         return True
-    if live_status in {"is_live", "is_upcoming"}:
+    if live_status in {"is_live", "is_upcoming", "post_live"}:
         return True
-    if info.get("was_live") is True and info.get("duration") in {None, 0}:
+    if info.get("was_live") is True and duration_unknown:
         return True
-    formats = info.get("formats") or []
-    for f in formats:
-        u = (f.get("url") or "")
+
+    # Some extractors don't expose `is_live` reliably; fall back to URL/manifest heuristics.
+    top_level_urls = [
+        info.get("url"),
+        info.get("manifest_url"),
+        info.get("hls_manifest_url"),
+        info.get("dash_manifest_url"),
+    ]
+    for u in top_level_urls:
+        if not isinstance(u, str):
+            continue
         if "yt_live_broadcast" in u:
             return True
-        proto = (f.get("protocol") or "").lower()
-        if proto.startswith("m3u8"):
-            # If only HLS is available and duration isn't known, treat as live-ish for Cloud.
-            if info.get("duration") is None:
+        if duration_unknown and ("hls_playlist" in u or u.endswith(".m3u8")):
+            return True
+
+    formats = info.get("formats") or []
+    for f in formats:
+        cand_urls = [
+            f.get("url"),
+            f.get("manifest_url"),
+            f.get("hls_manifest_url"),
+            f.get("dash_manifest_url"),
+        ]
+        for u in cand_urls:
+            if not isinstance(u, str):
+                continue
+            if "yt_live_broadcast" in u:
                 return True
+            if duration_unknown and ("hls_playlist" in u or u.endswith(".m3u8")):
+                return True
+
+        frags = f.get("fragments") or []
+        if frags:
+            fu = frags[0].get("url") if isinstance(frags[0], dict) else None
+            if isinstance(fu, str) and "yt_live_broadcast" in fu:
+                return True
+
+        proto = (f.get("protocol") or "").lower()
+        if proto.startswith("m3u8") and duration_unknown:
+            return True
     return False
 
 
