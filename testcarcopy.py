@@ -8,6 +8,9 @@ import pathlib
 import importlib
 from collections import defaultdict, deque
 
+# Ultralytics tries to write settings under ~/.config by default, which is often read-only on Streamlit Cloud.
+os.environ.setdefault("YOLO_CONFIG_DIR", os.path.join(tempfile.gettempdir(), "Ultralytics"))
+
 try:
     import cv2  # type: ignore
 except (ModuleNotFoundError, ImportError):
@@ -55,6 +58,7 @@ def _require_cv2():
                     "Missing dependency: `cv2` (OpenCV).\n\n"
                     "On Streamlit Cloud, prefer `opencv-python-headless` (and avoid installing `opencv-python`).\n"
                     "Note: `ultralytics` often pulls in `opencv-python` by default; this repo's `postBuild` forces headless.\n"
+                    "If you see `libGL.so.1` missing on Streamlit Cloud, add system packages via `packages.txt` (e.g. `libgl1`).\n"
                     "Reboot the app to trigger a fresh build.\n\n"
                     f"Original import error: {e}"
                 ) from e
@@ -122,6 +126,40 @@ def extract_youtube_stream(url):
 def _looks_like_hls_stream(url: str) -> bool:
     u = (url or "").lower()
     return u.startswith(("http://", "https://")) and (u.endswith(".m3u8") or "hls_playlist" in u or "/hls_" in u)
+
+
+def download_youtube_video(url: str, *, out_dir: str | None = None) -> str | None:
+    """Download a YouTube URL to a local mp4 (fallback when the direct URL is HLS)."""
+    out_dir = out_dir or tempfile.mkdtemp(prefix="yt_")
+    out_tmpl = os.path.join(out_dir, "video.%(ext)s")
+    cmd = [
+        "yt-dlp",
+        "--no-playlist",
+        "--no-warnings",
+        "-f",
+        "bestvideo+bestaudio/best",
+        "--merge-output-format",
+        "mp4",
+        "-o",
+        out_tmpl,
+        url,
+    ]
+    try:
+        subprocess.check_call(cmd)
+    except Exception as e:
+        print(f"Error downloading video: {e}")
+        return None
+
+    for ext in ("mp4", "mkv", "webm", "mov"):
+        candidate = os.path.join(out_dir, f"video.{ext}")
+        if os.path.exists(candidate):
+            return candidate
+
+    try:
+        files = sorted(pathlib.Path(out_dir).glob("video.*"))
+        return str(files[0]) if files else None
+    except Exception:
+        return None
 
 
 def _heat_colormap_bgr01(v: np.ndarray) -> np.ndarray:
@@ -374,9 +412,12 @@ def run_cli():
         return
 
     if _looks_like_hls_stream(source):
-        print("❌ This YouTube stream is HLS (.m3u8). OpenCV VideoCapture often can't open HLS URLs.")
-        print("   Use a downloaded/uploaded video file instead.")
-        return
+        print("⚠️ This YouTube source is HLS (.m3u8). Downloading to a local file for compatibility…")
+        downloaded = download_youtube_video(url)
+        if not downloaded:
+            print("❌ Download failed. Use a downloaded/uploaded video file instead.")
+            return
+        source = downloaded
 
     cap = cv2.VideoCapture(source)
     if not cap.isOpened():
@@ -556,18 +597,20 @@ def run_streamlit():
 
     source = None
     if input_mode == "YouTube URL":
-        url = DEFAULT_YOUTUBE_URL
-        st.text_input("YouTube URL", value=url, disabled=True)
+        url = st.text_input("YouTube URL", value=DEFAULT_YOUTUBE_URL)
         if start:
             source = extract_youtube_stream(url.strip())
-            if not source:
-                st.error("Failed to extract stream. Ensure `yt-dlp` is installed and the URL is valid.")
-                st.stop()
             if _looks_like_hls_stream(source):
-                st.error(
-                    "This YouTube source is an HLS stream (.m3u8). OpenCV on Streamlit Cloud usually can't open it.\n\n"
-                    "Use **Upload video** (recommended) or **Webcam** mode instead."
-                )
+                status_slot.caption("HLS stream detected; downloading locally…")
+                out_dir = tempfile.mkdtemp(prefix="yt_streamlit_")
+                downloaded = download_youtube_video(url.strip(), out_dir=out_dir)
+                if not downloaded:
+                    st.error("Failed to download YouTube video. Try **Upload video** instead.")
+                    st.stop()
+                st.session_state.tmpfile = downloaded
+                source = downloaded
+            if not source:
+                st.error("Failed to get video source. Ensure `yt-dlp` is installed and the URL is valid.")
                 st.stop()
     elif input_mode == "Upload video":
         upload = st.file_uploader("Upload .mp4/.mov", type=["mp4", "mov", "mkv", "avi"])
