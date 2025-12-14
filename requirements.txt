@@ -5,6 +5,7 @@ yt-dlp
 ultralytics
 torch
 torchvision
+shapely>=2.0.0,<3
 
 # Optional (only needed for "Webcam (streamlit-webrtc)" mode):
 # streamlit-webrtc
