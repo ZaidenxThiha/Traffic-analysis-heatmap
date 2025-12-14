@@ -1,8 +1,10 @@
-numpy==1.24.3
-opencv-python-headless==4.9.0.80
-streamlit==1.32.0
-yt-dlp==2024.1.1
-ultralytics==8.1.14
+numpy<2
+opencv-python-headless
+streamlit
+yt-dlp
+ultralytics
+torch
+torchvision
 
 # Optional (only needed for "Webcam (streamlit-webrtc)" mode):
 # streamlit-webrtc
