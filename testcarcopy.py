@@ -103,6 +103,10 @@ CONGESTION_THRESHOLD = 150
 
 VEHICLE_CLASSES = [1, 2, 3, 5, 7]
 
+# Simple tracker (no external deps like `lap`)
+TRACK_MAX_AGE = 30
+TRACK_DIST_THRESHOLD = 60.0
+
 
 # ===============================
 # UTILITIES
@@ -267,6 +271,103 @@ def _heat_colormap_bgr01(v: np.ndarray) -> np.ndarray:
     return np.stack([b, g, r], axis=-1)
 
 
+def _bbox_iou(a, b) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+    iw = max(0.0, ix2 - ix1)
+    ih = max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0.0:
+        return 0.0
+    a_area = max(0.0, (ax2 - ax1)) * max(0.0, (ay2 - ay1))
+    b_area = max(0.0, (bx2 - bx1)) * max(0.0, (by2 - by1))
+    denom = a_area + b_area - inter
+    return float(inter / denom) if denom > 0 else 0.0
+
+
+class SimpleTracker:
+    def __init__(self, *, max_age: int = TRACK_MAX_AGE, dist_threshold: float = TRACK_DIST_THRESHOLD):
+        self.max_age = int(max_age)
+        self.dist_threshold = float(dist_threshold)
+        self._next_id = 1
+        self._frame_idx = 0
+        self._tracks = {}  # id -> {"bbox": (x1,y1,x2,y2), "cx": int, "cy": int, "last_seen": int}
+
+    def _new_id(self) -> int:
+        tid = self._next_id
+        self._next_id += 1
+        return tid
+
+    def update(self, boxes_xyxy: np.ndarray) -> list[tuple[tuple[int, int, int, int], int]]:
+        self._frame_idx += 1
+
+        dets = []
+        for box in boxes_xyxy:
+            x1, y1, x2, y2 = map(int, box)
+            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+            dets.append({"bbox": (x1, y1, x2, y2), "cx": cx, "cy": cy})
+
+        track_ids = list(self._tracks.keys())
+        unmatched_tracks = set(track_ids)
+        unmatched_dets = set(range(len(dets)))
+        matches = []
+
+        if track_ids and dets:
+            # Greedy match by (distance, -iou)
+            candidates = []
+            for tid in track_ids:
+                t = self._tracks[tid]
+                tb = t["bbox"]
+                for di, d in enumerate(dets):
+                    dx = float(d["cx"] - t["cx"])
+                    dy = float(d["cy"] - t["cy"])
+                    dist = math.hypot(dx, dy)
+                    if dist > self.dist_threshold:
+                        continue
+                    iou = _bbox_iou(tb, d["bbox"])
+                    candidates.append((dist, -iou, tid, di))
+
+            candidates.sort()
+            used_tracks = set()
+            used_dets = set()
+            for _, __, tid, di in candidates:
+                if tid in used_tracks or di in used_dets:
+                    continue
+                used_tracks.add(tid)
+                used_dets.add(di)
+                matches.append((tid, di))
+
+            unmatched_tracks -= used_tracks
+            unmatched_dets -= used_dets
+
+        # Update matched tracks
+        for tid, di in matches:
+            d = dets[di]
+            self._tracks[tid] = {"bbox": d["bbox"], "cx": d["cx"], "cy": d["cy"], "last_seen": self._frame_idx}
+
+        # Create new tracks for unmatched detections
+        for di in list(unmatched_dets):
+            d = dets[di]
+            tid = self._new_id()
+            self._tracks[tid] = {"bbox": d["bbox"], "cx": d["cx"], "cy": d["cy"], "last_seen": self._frame_idx}
+            matches.append((tid, di))
+
+        # Remove stale tracks
+        stale = [tid for tid, t in self._tracks.items() if (self._frame_idx - int(t["last_seen"])) > self.max_age]
+        for tid in stale:
+            self._tracks.pop(tid, None)
+
+        # Return detections with their track ids
+        out = []
+        for tid, di in matches:
+            out.append((dets[di]["bbox"], tid))
+        return out
+
+
 class HeatmapAccumulator:
     def __init__(self, *, decay: float = HEATMAP_DECAY, radius: int = HEATMAP_RADIUS):
         self.decay = float(decay)
@@ -351,6 +452,7 @@ def process_frame(
     *,
     model,
     heatmap_acc,
+    tracker,
     track_history,
     fps,
     conf=CONF,
@@ -363,9 +465,8 @@ def process_frame(
     stopped_ids = set()
     moving_ids = set()
 
-    results = model.track(
+    results = model.predict(
         frame,
-        persist=True,
         conf=conf,
         iou=iou,
         classes=VEHICLE_CLASSES,
@@ -378,12 +479,10 @@ def process_frame(
     frame_for_overlay = frame.copy()
     draw_items = []
 
-    if results.boxes.id is not None:
+    if results.boxes is not None and len(results.boxes) > 0:
         boxes = results.boxes.xyxy.cpu().numpy()
-        ids = results.boxes.id.cpu().numpy().astype(int)
-
-        for box, track_id in zip(boxes, ids):
-            x1, y1, x2, y2 = map(int, box)
+        tracked = tracker.update(boxes)
+        for (x1, y1, x2, y2), track_id in tracked:
             cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
 
             track_history[track_id].append((cx, cy))
@@ -506,6 +605,7 @@ def run_cli():
 
     track_history = defaultdict(lambda: deque(maxlen=MOTION_WINDOW))
     heatmap_acc = HeatmapAccumulator(decay=HEATMAP_DECAY, radius=HEATMAP_RADIUS)
+    tracker = SimpleTracker()
 
     print(f"✅ Processing at {INFERENCE_SIZE}px inference. Press 'q' to exit.")
 
@@ -521,6 +621,7 @@ def run_cli():
             frame,
             model=model,
             heatmap_acc=heatmap_acc,
+            tracker=tracker,
             track_history=track_history,
             fps=fps,
             conf=CONF,
@@ -593,6 +694,8 @@ def run_streamlit():
         st.session_state.track_history = defaultdict(lambda: deque(maxlen=MOTION_WINDOW))
     if "heatmap_acc" not in st.session_state:
         st.session_state.heatmap_acc = HeatmapAccumulator(decay=heat_decay, radius=heat_radius)
+    if "tracker" not in st.session_state:
+        st.session_state.tracker = SimpleTracker()
     st.session_state.heatmap_acc.decay = float(heat_decay)
     st.session_state.heatmap_acc.radius = int(heat_radius)
 
@@ -618,6 +721,7 @@ def run_streamlit():
                 self.model = model
                 self.track_history = defaultdict(lambda: deque(maxlen=MOTION_WINDOW))
                 self.heatmap_acc = HeatmapAccumulator(decay=heat_decay, radius=heat_radius)
+                self.tracker = SimpleTracker()
                 self.last_ts = None
                 self.fps = 30.0
 
@@ -634,6 +738,7 @@ def run_streamlit():
                     img,
                     model=self.model,
                     heatmap_acc=self.heatmap_acc,
+                    tracker=self.tracker,
                     track_history=self.track_history,
                     fps=self.fps,
                     conf=conf,
@@ -713,6 +818,7 @@ def run_streamlit():
                 pass
         st.session_state.track_history = defaultdict(lambda: deque(maxlen=MOTION_WINDOW))
         st.session_state.heatmap_acc = HeatmapAccumulator(decay=heat_decay, radius=heat_radius)
+        st.session_state.tracker = SimpleTracker()
         st.session_state.cap = cv2.VideoCapture(source)
         if not st.session_state.cap.isOpened():
             st.session_state.cap = None
@@ -737,6 +843,7 @@ def run_streamlit():
                 frame,
                 model=model,
                 heatmap_acc=st.session_state.heatmap_acc,
+                tracker=st.session_state.tracker,
                 track_history=st.session_state.track_history,
                 fps=st.session_state.fps,
                 conf=conf,
