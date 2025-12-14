@@ -77,6 +77,17 @@ def _require_ultralytics():
             "If the import fails due to `torch` missing, install a compatible PyTorch wheel for your Python version."
         ) from e
 
+    # On Streamlit Cloud, `YOLO.track()` may fail because Ultralytics tracking pulls optional deps like `lap`.
+    # This app only needs detection + a lightweight tracker, so map `.track()` to `.predict()` defensively.
+    if not getattr(YOLO, "_traffic_heatmap_track_patched", False):
+        def _track_as_predict(self, source=None, *args, **kwargs):
+            kwargs.pop("persist", None)
+            kwargs.pop("tracker", None)
+            return self.predict(source, *args, **kwargs)
+
+        YOLO.track = _track_as_predict  # type: ignore[assignment]
+        YOLO._traffic_heatmap_track_patched = True  # type: ignore[attr-defined]
+
     return YOLO
 
 
