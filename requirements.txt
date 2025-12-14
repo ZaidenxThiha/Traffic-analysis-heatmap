@@ -1,6 +1,9 @@
 numpy<2
 opencv-python-headless==4.10.0.84
-opencv-python==0
+
+# Explicitly prevent GUI OpenCV from installing on Linux (Streamlit Cloud)
+opencv-python==4.10.0.84; platform_system=="Windows"
+
 streamlit
 yt-dlp
 ultralytics==8.3.237
