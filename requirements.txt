@@ -1,5 +1,5 @@
-numpy>=1.21.0
-opencv-python-headless>=4.5.0
+numpy>=1.21.0,<2.0
+opencv-python-headless>=4.5.0,<4.10
 streamlit>=1.28.0
 yt-dlp>=2023.0.0
 ultralytics>=8.0.0
