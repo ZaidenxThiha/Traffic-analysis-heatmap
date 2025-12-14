@@ -128,6 +128,24 @@ def _looks_like_hls_stream(url: str) -> bool:
     return u.startswith(("http://", "https://")) and (u.endswith(".m3u8") or "hls_playlist" in u or "/hls_" in u)
 
 
+def get_ytdlp_info(url: str) -> dict | None:
+    cmd = [
+        "yt-dlp",
+        "--no-playlist",
+        "--no-warnings",
+        "-J",
+        url,
+    ]
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
+        import json
+
+        return json.loads(out)
+    except Exception as e:
+        print(f"Error fetching yt-dlp info: {e}")
+        return None
+
+
 def download_youtube_video(url: str, *, out_dir: str | None = None) -> str | None:
     """Download a YouTube URL to a local mp4 (fallback when the direct URL is HLS)."""
     out_dir = out_dir or tempfile.mkdtemp(prefix="yt_")
@@ -406,18 +424,18 @@ def run_cli():
     model = YOLO(MODEL_PATH)
 
     url = input("Enter YouTube URL: ").strip()
-    source = extract_youtube_stream(url)
-    if not source:
-        print("❌ Failed to extract stream.")
+    info = get_ytdlp_info(url)
+    is_live = bool((info or {}).get("is_live") or (info or {}).get("live_status") in {"is_live", "post_live"})
+    if is_live:
+        print("❌ Live YouTube streams are not supported in this mode.")
+        print("   Download locally (or use a recorded video) and pass a file path instead.")
         return
 
-    if _looks_like_hls_stream(source):
-        print("⚠️ This YouTube source is HLS (.m3u8). Downloading to a local file for compatibility…")
-        downloaded = download_youtube_video(url)
-        if not downloaded:
-            print("❌ Download failed. Use a downloaded/uploaded video file instead.")
-            return
-        source = downloaded
+    print("⬇️ Downloading YouTube video to a local file…")
+    source = download_youtube_video(url)
+    if not source:
+        print("❌ Download failed. Use a downloaded/uploaded video file instead.")
+        return
 
     cap = cv2.VideoCapture(source)
     if not cap.isOpened():
@@ -599,19 +617,26 @@ def run_streamlit():
     if input_mode == "YouTube URL":
         url = st.text_input("YouTube URL", value=DEFAULT_YOUTUBE_URL)
         if start:
-            source = extract_youtube_stream(url.strip())
-            if _looks_like_hls_stream(source):
-                status_slot.caption("HLS stream detected; downloading locally…")
-                out_dir = tempfile.mkdtemp(prefix="yt_streamlit_")
-                downloaded = download_youtube_video(url.strip(), out_dir=out_dir)
-                if not downloaded:
-                    st.error("Failed to download YouTube video. Try **Upload video** instead.")
-                    st.stop()
-                st.session_state.tmpfile = downloaded
-                source = downloaded
-            if not source:
-                st.error("Failed to get video source. Ensure `yt-dlp` is installed and the URL is valid.")
+            info = get_ytdlp_info(url.strip())
+            is_live = bool((info or {}).get("is_live") or (info or {}).get("live_status") in {"is_live", "post_live"})
+            if is_live:
+                st.error(
+                    "This looks like a **YouTube live stream**. Streamlit Cloud often can't download live HLS streams (403 from Googlevideo).\n\n"
+                    "Use **Upload video** instead (download the video locally first), or use a non-live/recorded YouTube video."
+                )
                 st.stop()
+
+            status_slot.caption("Downloading YouTube video locally…")
+            out_dir = tempfile.mkdtemp(prefix="yt_streamlit_")
+            downloaded = download_youtube_video(url.strip(), out_dir=out_dir)
+            if not downloaded:
+                st.error(
+                    "Failed to download YouTube video (common on Streamlit Cloud).\n\n"
+                    "Use **Upload video** instead."
+                )
+                st.stop()
+            st.session_state.tmpfile = downloaded
+            source = downloaded
     elif input_mode == "Upload video":
         upload = st.file_uploader("Upload .mp4/.mov", type=["mp4", "mov", "mkv", "avi"])
         if start:
