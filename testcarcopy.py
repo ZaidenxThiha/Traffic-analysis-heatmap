@@ -58,7 +58,6 @@ def _require_cv2():
 def _require_ultralytics():
     try:
         from ultralytics import YOLO  # type: ignore
-        from ultralytics.solutions import Heatmap  # type: ignore
     except ModuleNotFoundError as e:
         raise ModuleNotFoundError(
             "Missing dependency: `ultralytics`.\n\n"
@@ -67,7 +66,7 @@ def _require_ultralytics():
             "If the import fails due to `torch` missing, install a compatible PyTorch wheel for your Python version."
         ) from e
 
-    return YOLO, Heatmap
+    return YOLO
 
 
 # ===============================
@@ -87,6 +86,8 @@ STOP_SPEED_THRESHOLD = 2.0
 
 # Heatmap
 HEATMAP_DECAY = 0.995
+HEATMAP_ALPHA = 0.45
+HEATMAP_RADIUS = 24
 CONGESTION_THRESHOLD = 150
 
 VEHICLE_CLASSES = [1, 2, 3, 5, 7]
@@ -116,6 +117,113 @@ def _looks_like_hls_stream(url: str) -> bool:
     return u.startswith(("http://", "https://")) and (u.endswith(".m3u8") or "hls_playlist" in u or "/hls_" in u)
 
 
+def _heat_colormap_bgr01(v: np.ndarray) -> np.ndarray:
+    """Map normalized heat [0..1] to BGR colors in [0..1], without OpenCV/matplotlib."""
+    v = np.clip(v, 0.0, 1.0)
+    r = np.zeros_like(v, dtype=np.float32)
+    g = np.zeros_like(v, dtype=np.float32)
+    b = np.zeros_like(v, dtype=np.float32)
+
+    m1 = v < 0.25
+    m2 = (v >= 0.25) & (v < 0.5)
+    m3 = (v >= 0.5) & (v < 0.75)
+    m4 = v >= 0.75
+
+    # blue -> cyan
+    b[m1] = 1.0
+    g[m1] = (v[m1] / 0.25)
+
+    # cyan -> green
+    g[m2] = 1.0
+    b[m2] = 1.0 - ((v[m2] - 0.25) / 0.25)
+
+    # green -> yellow
+    g[m3] = 1.0
+    r[m3] = ((v[m3] - 0.5) / 0.25)
+
+    # yellow -> red
+    r[m4] = 1.0
+    g[m4] = 1.0 - ((v[m4] - 0.75) / 0.25)
+
+    return np.stack([b, g, r], axis=-1)
+
+
+class HeatmapAccumulator:
+    def __init__(self, *, decay: float = HEATMAP_DECAY, radius: int = HEATMAP_RADIUS):
+        self.decay = float(decay)
+        self.radius = int(radius)
+        self.heatmap = None
+        self._kernel = None
+        self._kernel_radius = None
+
+    def _ensure_heatmap(self, h: int, w: int) -> None:
+        if self.heatmap is None or self.heatmap.shape[:2] != (h, w):
+            self.heatmap = np.zeros((h, w), dtype=np.float32)
+
+    def _ensure_kernel(self) -> None:
+        r = max(1, int(self.radius))
+        if self._kernel is not None and self._kernel_radius == r:
+            return
+        sigma = max(1.0, r / 2.0)
+        ax = np.arange(-r, r + 1, dtype=np.float32)
+        xx, yy = np.meshgrid(ax, ax)
+        kernel = np.exp(-(xx * xx + yy * yy) / (2.0 * sigma * sigma))
+        kernel /= max(1e-6, float(kernel.max()))
+        self._kernel = kernel.astype(np.float32)
+        self._kernel_radius = r
+
+    def step(self, frame_h: int, frame_w: int) -> None:
+        self._ensure_heatmap(frame_h, frame_w)
+        self._ensure_kernel()
+        self.heatmap *= self.decay
+
+    def add_point(self, x: int, y: int, *, strength: float = 1.0) -> None:
+        if self.heatmap is None:
+            return
+        r = int(self._kernel_radius or self.radius or 1)
+        h, w = self.heatmap.shape[:2]
+        if not (0 <= x < w and 0 <= y < h):
+            return
+
+        x1 = max(0, x - r)
+        y1 = max(0, y - r)
+        x2 = min(w, x + r + 1)
+        y2 = min(h, y + r + 1)
+
+        kx1 = x1 - (x - r)
+        ky1 = y1 - (y - r)
+        kx2 = kx1 + (x2 - x1)
+        ky2 = ky1 + (y2 - y1)
+
+        self.heatmap[y1:y2, x1:x2] += float(strength) * self._kernel[ky1:ky2, kx1:kx2]
+
+    def value_255(self, x: int, y: int) -> float:
+        if self.heatmap is None:
+            return 0.0
+        h, w = self.heatmap.shape[:2]
+        if not (0 <= x < w and 0 <= y < h):
+            return 0.0
+        mx = float(np.max(self.heatmap))
+        if mx <= 1e-6:
+            return 0.0
+        return float((self.heatmap[y, x] / mx) * 255.0)
+
+    def overlay_bgr(self, frame_bgr: np.ndarray, *, alpha: float = HEATMAP_ALPHA) -> np.ndarray:
+        if self.heatmap is None:
+            return frame_bgr
+        mx = float(np.max(self.heatmap))
+        if mx <= 1e-6:
+            return frame_bgr
+
+        v = (self.heatmap / mx).astype(np.float32)
+        cmap_bgr = (_heat_colormap_bgr01(v) * 255.0).astype(np.float32)
+
+        base = frame_bgr.astype(np.float32)
+        a = float(np.clip(alpha, 0.0, 1.0))
+        out = base * (1.0 - a) + cmap_bgr * a
+        return np.clip(out, 0.0, 255.0).astype(np.uint8)
+
+
 # ===============================
 # FRAME PROCESSING
 # ===============================
@@ -123,14 +231,15 @@ def process_frame(
     frame,
     *,
     model,
-    yolo_heatmap,
+    heatmap_acc,
     track_history,
     fps,
     conf=CONF,
     iou=IOU,
     imgsz=INFERENCE_SIZE,
+    heat_alpha=HEATMAP_ALPHA,
 ):
-    """Run YOLO tracking + Ultralytics Heatmap, returning an annotated BGR image and counters."""
+    """Run YOLO tracking + a simple accumulated heatmap, returning an annotated BGR image and counters."""
     cv2 = _require_cv2()
     stopped_ids = set()
     moving_ids = set()
@@ -145,14 +254,14 @@ def process_frame(
         verbose=False,
     )[0]
 
-    solution_results = yolo_heatmap.process(frame)
-    frame_with_heatmap = solution_results.plot_im
+    h, w = frame.shape[:2]
+    heatmap_acc.step(h, w)
+    frame_for_overlay = frame.copy()
+    draw_items = []
 
     if results.boxes.id is not None:
         boxes = results.boxes.xyxy.cpu().numpy()
         ids = results.boxes.id.cpu().numpy().astype(int)
-
-        heat_arr = getattr(yolo_heatmap, "heatmap", None)
 
         for box, track_id in zip(boxes, ids):
             x1, y1, x2, y2 = map(int, box)
@@ -160,6 +269,7 @@ def process_frame(
 
             track_history[track_id].append((cx, cy))
             points = list(track_history[track_id])
+            heatmap_acc.add_point(cx, cy, strength=1.0)
 
             if len(points) > 1:
                 dist = math.hypot(points[-1][0] - points[0][0], points[-1][1] - points[0][1])
@@ -168,12 +278,7 @@ def process_frame(
             else:
                 speed_mps = 0.0
 
-            heat_value = 0.0
-            if heat_arr is not None:
-                hh, ww = heat_arr.shape[:2]
-                if 0 <= cy < hh and 0 <= cx < ww:
-                    pixel = heat_arr[cy, cx]
-                    heat_value = float(np.mean(pixel))
+            heat_value = heatmap_acc.value_255(cx, cy)
 
             is_stopped = speed_mps < STOP_SPEED_THRESHOLD
             is_congested = heat_value > CONGESTION_THRESHOLD
@@ -194,20 +299,25 @@ def process_frame(
                 label = f"{speed_mps:.1f} m/s"
                 color = (0, 255, 0)
 
-            cv2.rectangle(frame_with_heatmap, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(
-                frame_with_heatmap,
-                label,
-                (x1, y1 - 10),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                color,
-                2,
-            )
+            draw_items.append((x1, y1, x2, y2, label, color))
+
+    frame_with_heatmap = heatmap_acc.overlay_bgr(frame_for_overlay, alpha=heat_alpha)
+
+    for x1, y1, x2, y2, label, color in draw_items:
+        cv2.rectangle(frame_with_heatmap, (x1, y1), (x2, y2), color, 2)
+        cv2.putText(
+            frame_with_heatmap,
+            label,
+            (x1, y1 - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            color,
+            2,
+        )
 
     cv2.putText(
         frame_with_heatmap,
-        f"Mode: Ultralytics Heatmap | {imgsz}px",
+        f"Mode: YOLO + Accum Heatmap | {imgsz}px",
         (20, 40),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.7,
@@ -242,7 +352,7 @@ def process_frame(
 def run_cli():
     try:
         cv2 = _require_cv2()
-        YOLO, Heatmap = _require_ultralytics()
+        YOLO = _require_ultralytics()
     except Exception as e:
         print(str(e))
         return
@@ -273,14 +383,8 @@ def run_cli():
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
 
-    # Ultralytics native heatmap (current API uses .process())
-    yolo_heatmap = Heatmap(
-        model=MODEL_PATH,
-        classes=VEHICLE_CLASSES,
-        colormap=cv2.COLORMAP_TURBO,
-    )
-
     track_history = defaultdict(lambda: deque(maxlen=MOTION_WINDOW))
+    heatmap_acc = HeatmapAccumulator(decay=HEATMAP_DECAY, radius=HEATMAP_RADIUS)
 
     print(f"✅ Processing at {INFERENCE_SIZE}px inference. Press 'q' to exit.")
 
@@ -295,7 +399,7 @@ def run_cli():
         frame_with_heatmap, _, _ = process_frame(
             frame,
             model=model,
-            yolo_heatmap=yolo_heatmap,
+            heatmap_acc=heatmap_acc,
             track_history=track_history,
             fps=fps,
             conf=CONF,
@@ -329,13 +433,13 @@ def run_streamlit():
 
     try:
         cv2 = _require_cv2()
-        YOLO, Heatmap = _require_ultralytics()
+        YOLO = _require_ultralytics()
     except Exception as e:
         st.error(str(e))
         st.stop()
 
-    st.set_page_config(page_title="Traffic Heatmap (YOLO + Ultralytics Heatmap)", layout="wide")
-    st.title("Traffic analysis heatmap (YOLO tracking + Ultralytics Heatmap)")
+    st.set_page_config(page_title="Traffic Heatmap (YOLO)", layout="wide")
+    st.title("Traffic analysis heatmap (YOLO tracking + accumulated heatmap)")
 
     weights = sorted(str(p) for p in pathlib.Path(".").glob("*.pt"))
     default_weight = MODEL_PATH if MODEL_PATH in weights else (weights[0] if weights else MODEL_PATH)
@@ -347,6 +451,9 @@ def run_streamlit():
         iou = st.slider("IOU", 0.0, 1.0, float(IOU), 0.01)
         imgsz = st.select_slider("Inference size", options=[640, 960, 1280, 1600], value=int(INFERENCE_SIZE))
         frames_per_run = st.select_slider("Frames per refresh", options=[1, 2, 4, 8, 16], value=4)
+        heat_alpha = st.slider("Heat overlay alpha", 0.0, 1.0, float(HEATMAP_ALPHA), 0.01)
+        heat_radius = st.select_slider("Heat radius", options=[8, 12, 16, 24, 32, 40], value=int(HEATMAP_RADIUS))
+        heat_decay = st.slider("Heat decay", 0.90, 0.999, float(HEATMAP_DECAY), 0.001)
 
         st.divider()
         input_mode = st.radio("Source", options=["Webcam (streamlit-webrtc)", "YouTube URL", "Upload video"])
@@ -355,22 +462,18 @@ def run_streamlit():
         @st.cache_resource
         def _load_model(path):
             return YOLO(path)
-
-        @st.cache_resource
-        def _load_heatmap(path):
-            return Heatmap(model=path, classes=VEHICLE_CLASSES, colormap=cv2.COLORMAP_TURBO)
     else:
         def _load_model(path):
             return YOLO(path)
 
-        def _load_heatmap(path):
-            return Heatmap(model=path, classes=VEHICLE_CLASSES, colormap=cv2.COLORMAP_TURBO)
-
     model = _load_model(weight_path)
-    yolo_heatmap = _load_heatmap(weight_path)
 
     if "track_history" not in st.session_state:
         st.session_state.track_history = defaultdict(lambda: deque(maxlen=MOTION_WINDOW))
+    if "heatmap_acc" not in st.session_state:
+        st.session_state.heatmap_acc = HeatmapAccumulator(decay=heat_decay, radius=heat_radius)
+    st.session_state.heatmap_acc.decay = float(heat_decay)
+    st.session_state.heatmap_acc.radius = int(heat_radius)
 
     col1, col2 = st.columns([2, 1])
     frame_slot = col1.empty()
@@ -392,8 +495,8 @@ def run_streamlit():
         class VideoProcessor:
             def __init__(self):
                 self.model = model
-                self.yolo_heatmap = yolo_heatmap
                 self.track_history = defaultdict(lambda: deque(maxlen=MOTION_WINDOW))
+                self.heatmap_acc = HeatmapAccumulator(decay=heat_decay, radius=heat_radius)
                 self.last_ts = None
                 self.fps = 30.0
 
@@ -409,12 +512,13 @@ def run_streamlit():
                 out, stopped, moving = process_frame(
                     img,
                     model=self.model,
-                    yolo_heatmap=self.yolo_heatmap,
+                    heatmap_acc=self.heatmap_acc,
                     track_history=self.track_history,
                     fps=self.fps,
                     conf=conf,
                     iou=iou,
                     imgsz=imgsz,
+                    heat_alpha=heat_alpha,
                 )
                 return av.VideoFrame.from_ndarray(out, format="bgr24")
 
@@ -478,6 +582,7 @@ def run_streamlit():
             except Exception:
                 pass
         st.session_state.track_history = defaultdict(lambda: deque(maxlen=MOTION_WINDOW))
+        st.session_state.heatmap_acc = HeatmapAccumulator(decay=heat_decay, radius=heat_radius)
         st.session_state.cap = cv2.VideoCapture(source)
         if not st.session_state.cap.isOpened():
             st.session_state.cap = None
@@ -501,12 +606,13 @@ def run_streamlit():
             processed, stopped, moving = process_frame(
                 frame,
                 model=model,
-                yolo_heatmap=yolo_heatmap,
+                heatmap_acc=st.session_state.heatmap_acc,
                 track_history=st.session_state.track_history,
                 fps=st.session_state.fps,
                 conf=conf,
                 iou=iou,
                 imgsz=imgsz,
+                heat_alpha=heat_alpha,
             )
             frame_slot.image(processed, channels="BGR", use_container_width=True)
             stopped_slot.metric("Stopped", stopped)
